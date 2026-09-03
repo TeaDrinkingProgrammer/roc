@@ -9229,11 +9229,72 @@ fn hoistedTopLevelDefForNode(
 ) ?HoistedCallableDef {
     for (module.store.sliceDefs(module.global_value_defs)) |def_idx| {
         const def = module.store.getDef(def_idx);
-        if (ModuleEnv.nodeIdxFrom(def_idx) == node or ModuleEnv.nodeIdxFrom(def.pattern) == node or ModuleEnv.nodeIdxFrom(def.expr) == node) {
+        if (ModuleEnv.nodeIdxFrom(def_idx) == node or ModuleEnv.nodeIdxFrom(def.expr) == node or patternBindsNode(module, def.pattern, node)) {
             return .{ .module = module, .def = def_idx };
         }
     }
     return null;
+}
+
+/// Whether `pattern` is `node` or binds `node` somewhere inside it, so that a
+/// name bound by a destructure resolves to the def that destructures.
+fn patternBindsNode(module: *const ModuleEnv, pattern: CIR.Pattern.Idx, node: CIR.Node.Idx) bool {
+    if (ModuleEnv.nodeIdxFrom(pattern) == node) return true;
+    return switch (module.store.getPattern(pattern)) {
+        .assign => false,
+        .as => |as_pattern| patternBindsNode(module, as_pattern.pattern, node),
+        .applied_tag => |tag| blk: {
+            for (module.store.slicePatterns(tag.args)) |arg| {
+                if (patternBindsNode(module, arg, node)) break :blk true;
+            }
+            break :blk false;
+        },
+        .nominal => |nominal| patternBindsNode(module, nominal.backing_pattern, node),
+        .nominal_external => |nominal| patternBindsNode(module, nominal.backing_pattern, node),
+        .record_destructure => |record| blk: {
+            for (module.store.sliceRecordDestructs(record.destructs)) |destruct_idx| {
+                const destruct = module.store.getRecordDestruct(destruct_idx);
+                if (patternBindsNode(module, destruct.kind.toPatternIdx(), node)) break :blk true;
+            }
+            break :blk false;
+        },
+        .list => |list| blk: {
+            for (module.store.slicePatterns(list.patterns)) |item| {
+                if (patternBindsNode(module, item, node)) break :blk true;
+            }
+            if (list.rest_info) |rest| {
+                if (rest.pattern) |rest_pattern| {
+                    if (patternBindsNode(module, rest_pattern, node)) break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .tuple => |tuple| blk: {
+            for (module.store.slicePatterns(tuple.patterns)) |item| {
+                if (patternBindsNode(module, item, node)) break :blk true;
+            }
+            break :blk false;
+        },
+        .str_interpolation => |str| blk: {
+            for (0..str.steps.span.len) |offset| {
+                const step = module.store.getStrPatternStep(str.steps, @intCast(offset));
+                if (step.capture) |capture| {
+                    if (patternBindsNode(module, capture, node)) break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .num_literal,
+        .num_from_numeral_literal,
+        .small_dec_literal,
+        .dec_literal,
+        .frac_f32_literal,
+        .frac_f64_literal,
+        .str_literal,
+        .underscore,
+        .runtime_error,
+        => false,
+    };
 }
 
 fn hoistedExprSpanAllowsStoredConst(
@@ -32974,10 +33035,27 @@ fn expectCircularValueDefinitions(test_env: anytype, expected_names: []const []c
     }
 }
 
-test "top-level destructure in a value cycle with a plain def reports every name it binds" {
+test "top-level destructure of a literal in a value cycle reports the names in the cycle" {
     const TestEnv = @import("test/TestEnv.zig");
+    // `{a, b} = { a: c, b: 1 }` is the defs `a = c` and `b = 1`, so only `a`
+    // is part of the cycle with `c`.
     const source =
         \\{a, b} = { a: c, b: 1 }
+        \\c = a
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+
+    try expectCircularValueDefinitions(&test_env, &.{ "a", "c" });
+}
+
+test "top-level destructure of a computed value in a value cycle reports every name it binds" {
+    const TestEnv = @import("test/TestEnv.zig");
+    // The destructured value is computed, so every name it binds is
+    // computed by the one cyclic def.
+    const source =
+        \\pair = |x| { a: x, b: 1 }
+        \\{a, b} = pair(c)
         \\c = a
     ;
     var test_env = try TestEnv.init("Test", source);
@@ -32986,7 +33064,7 @@ test "top-level destructure in a value cycle with a plain def reports every name
     try expectCircularValueDefinitions(&test_env, &.{ "a", "b", "c" });
 }
 
-test "top-level tuple destructure in a value cycle reports every name it binds" {
+test "top-level tuple destructure of a literal in a value cycle reports the names in the cycle" {
     const TestEnv = @import("test/TestEnv.zig");
     const source =
         \\(a, b) = (c, 1)
@@ -32995,7 +33073,22 @@ test "top-level tuple destructure in a value cycle reports every name it binds" 
     var test_env = try TestEnv.init("Test", source);
     defer test_env.deinit();
 
-    try expectCircularValueDefinitions(&test_env, &.{ "a", "b", "c" });
+    try expectCircularValueDefinitions(&test_env, &.{ "a", "c" });
+}
+
+test "a function destructured from a top-level literal generalizes like a plain function def" {
+    const TestEnv = @import("test/TestEnv.zig");
+    const source =
+        \\{ same, n } = { same: |x| x, n: 1 }
+        \\first = same("s")
+        \\second = same(n)
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try test_env.assertDefType("first", "Str");
+    try test_env.assertDefType("second", "Dec");
 }
 
 test "name bound by a nested top-level destructure in a value cycle is a circular value definition" {
